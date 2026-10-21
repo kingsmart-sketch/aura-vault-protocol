@@ -29,15 +29,12 @@
 //! [`VaultError::BalanceMismatch`]: crate::VaultError::BalanceMismatch
 //! [`VaultError::ZeroAmount`]: crate::VaultError::ZeroAmount
 #![no_std]
-
 mod errors;
 mod interface;
 mod storage;
 mod governance;
 mod fee;
-
 pub use errors::VaultError;
-
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -72,9 +69,7 @@ mod lifecycle_test;
 mod cross_contract_safety_test;
 #[cfg(test)]
 mod reentrancy_test;
-
 use soroban_sdk::{contract, contractimpl, contractclient, token, Address, Env, Vec, Symbol};
-
 // ---------------------------------------------------------------------------
 // AuraPriceOracle external contract interface (Issue #348)
 //
@@ -89,7 +84,6 @@ pub trait OracleTrait {
     /// `price` is scaled to 6 decimal places (1_000_000 = $1.00).
     fn price(env: Env, token: Address) -> (i128, u64);
 }
-
 use storage::{
     bump_instance, bump_persistent, get_admin, get_balance, get_layout_version, get_token,
     get_total_deposited, get_total_shares, get_version, is_paused as storage_is_paused, set_admin,
@@ -110,41 +104,37 @@ use storage::{
     get_vault_name, set_vault_name, get_vault_symbol, set_vault_symbol, get_vault_version, set_vault_version,
     get_decimals, set_decimals,
     enter_reentrancy_guard, exit_reentrancy_guard, is_reentrancy_locked,
+    get_max_withdrawal_bps, set_max_withdrawal_bps,
+    get_last_withdrawal_ledger, set_last_withdrawal_ledger,
+    get_current_ledger_withdrawals, set_current_ledger_withdrawals,
 };
 use governance::{
     initialize_governance, create_proposal, vote_on_proposal, execute_proposal,
     get_proposal_status, ProposalStatus, ProposalType,
 };
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
 /// Scaling factor for the yield-per-share (YPS) accumulator.
 ///
 /// Using 1_000_000_000_000 (1e12) gives sub-stroop precision for any vault
 /// with ≤ 1e12 total shares outstanding.  For context, 1e12 stroops is
 /// 100_000 XLM — more than any realistic single-vault TVL at today's prices.
 pub const YIELD_PRECISION: i128 = 1_000_000_000_000;
-
 /// Maximum withdrawal fee in basis points (5%).
 pub const MAX_WITHDRAWAL_FEE_BPS: u32 = 500;
 pub const ROLE_ADMIN: u32 = storage::ADMIN_ROLE;
 pub const ROLE_KEEPER: u32 = storage::KEEPER_ROLE;
 pub const ROLE_GUARDIAN: u32 = storage::GUARDIAN_ROLE;
-
 fn has_role(env: &Env, addr: &Address, role_mask: u32) -> bool {
     storage::has_role(env, addr, role_mask)
 }
-
 fn set_role_mask(env: &Env, addr: &Address, mask: u32) {
     storage::set_role_mask(env, addr, mask)
 }
-
 // ---------------------------------------------------------------------------
 // Module-level helpers (non-contract functions)
 // ---------------------------------------------------------------------------
-
 /// Helper to enforce the reentrancy lock on all mutating functions (Issue #345).
 /// Enters guard (reverting with VaultError::Reentrancy if already locked)
 /// and guarantees the lock is cleared on both Ok and Err paths.
@@ -154,7 +144,6 @@ fn with_reentrancy_guard<T, F: FnOnce() -> Result<T, VaultError>>(env: &Env, f: 
     storage::exit_reentrancy_guard(env);
     result
 }
-
 /// Extend TTL of per-user yield accounting entries (checkpoint + pending).
 ///
 /// Called by `collect_pending_yield` and `distribute_yield` to keep user
@@ -162,22 +151,18 @@ fn with_reentrancy_guard<T, F: FnOnce() -> Result<T, VaultError>>(env: &Env, f: 
 fn bump_user_yield(env: &Env, addr: &Address) {
     storage::bump_user_yield_ttl(env, addr);
 }
-
 /// Maximum oracle price accepted without reverting.
 ///
 /// 1e24 in a 7-decimal token (Soroban stroops) is 1e17 tokens — far above any
 /// realistic price for any asset denominated in stroops.  Any value above this
 /// is almost certainly a feed misconfiguration or a manipulation attempt.
 pub const ORACLE_PRICE_SANITY_CAP: i128 = 1_000_000_000_000_000_000_000_000; // 1e24
-
 /// Maximum age of an oracle price before it is considered stale (seconds).
 /// Default: 3 600 s (1 hour).  Admin can narrow this via `set_oracle_max_age`.
 pub const ORACLE_DEFAULT_MAX_AGE_SECS: u64 = 3_600;
-
 // ---------------------------------------------------------------------------
 // Oracle price validation
 // ---------------------------------------------------------------------------
-
 /// Validate an oracle-supplied price:
 ///
 /// 1. Zero price — feed returned 0 (dead feed or manipulation).
@@ -208,11 +193,9 @@ pub(crate) fn validate_oracle_price(
     }
     Ok(())
 }
-
 // ---------------------------------------------------------------------------
 // Post-transfer balance assertions
 // ---------------------------------------------------------------------------
-
 /// Assert that an **incoming** transfer (caller → vault) moved exactly
 /// `expected` stroops into the vault.
 ///
@@ -242,7 +225,6 @@ pub(crate) fn assert_incoming_transfer(
     }
     Ok(())
 }
-
 /// Assert that an **outgoing** transfer (vault → recipient) moved exactly
 /// `expected` stroops out of the vault.
 pub(crate) fn assert_outgoing_transfer(
@@ -260,10 +242,8 @@ pub(crate) fn assert_outgoing_transfer(
     }
     Ok(())
 }
-
 #[contract]
 pub struct AuraVault;
-
 #[contractimpl]
 impl AuraVault {
     // -----------------------------------------------------------------------
@@ -319,7 +299,6 @@ impl AuraVault {
         bump_instance(&env);
         Ok(())
     }
-
     // -----------------------------------------------------------------------
     // deposit
     //
@@ -366,7 +345,6 @@ impl AuraVault {
     pub fn deposit(env: Env, caller: Address, amount: i128) -> Result<i128, VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if amount <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
@@ -376,18 +354,15 @@ impl AuraVault {
             if storage_is_paused(&env) {
                 return Err(VaultError::VaultPaused);
             }
-
             // Whitelist check — Issue #349
             if get_whitelist_enabled(&env) && !storage::is_whitelisted(&env, &caller) {
                 return Err(VaultError::NotWhitelisted);
             }
-
             // Minimum deposit check — Issue #355
             let min_deposit = get_min_deposit(&env);
             if min_deposit > 0 && amount < min_deposit {
                 return Err(VaultError::BelowMinDeposit);
             }
-
             // TVL cap check — 0 means unlimited (Issue #467)
             let tvl_cap = get_tvl_cap(&env);
             if tvl_cap > 0 {
@@ -399,10 +374,8 @@ impl AuraVault {
                     return Err(VaultError::TvlCapExceeded);
                 }
             }
-
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
-
             // Flash-loan guard: actual token balance must equal tracked state before deposit.
             let balance_before = token.balance(&env.current_contract_address());
             let total_deposited = get_total_deposited(&env);
@@ -413,9 +386,7 @@ impl AuraVault {
                 );
                 return Err(VaultError::BalanceMismatch);
             }
-
             let total_shares = get_total_shares(&env);
-
             // Compute shares to mint (checked arithmetic; overflow returns MathOverflow)
             let new_shares: i128 = if total_shares == 0 || total_deposited == 0 {
                 amount
@@ -427,17 +398,14 @@ impl AuraVault {
                     .checked_div(total_deposited)
                     .ok_or(VaultError::MathOverflow)?
             };
-
             if new_shares <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
-
             // CEI — Interaction: pull tokens from caller into vault
             let vault_addr = env.current_contract_address();
             let pre_deposit_balance = token.balance(&vault_addr);
             token.transfer(&caller, &vault_addr, &amount);
             assert_incoming_transfer(&token, &vault_addr, pre_deposit_balance, amount)?;
-
             // Effects: write state after successful transfer
             let old_balance = get_balance(&env, &caller);
             let new_balance = old_balance
@@ -466,14 +434,11 @@ impl AuraVault {
                 (Symbol::new(&env, "deposit"), caller.clone(), amount),
                 (new_shares, new_total_shares, new_total_deposited, share_price, timestamp),
             );
-
             bump_persistent(&env, &caller);
             bump_instance(&env);
-
             Ok(new_shares)
         })
     }
-
     // -----------------------------------------------------------------------
     // withdraw
     // -----------------------------------------------------------------------
@@ -530,7 +495,6 @@ impl AuraVault {
     pub fn withdraw(env: Env, caller: Address, shares: i128) -> Result<i128, VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if shares <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
@@ -540,10 +504,8 @@ impl AuraVault {
             if storage_is_paused(&env) {
                 return Err(VaultError::VaultPaused);
             }
-
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
-
             let balance_before = token.balance(&env.current_contract_address());
             let total_deposited = get_total_deposited(&env);
             if balance_before != total_deposited {
@@ -553,27 +515,61 @@ impl AuraVault {
                 );
                 return Err(VaultError::BalanceMismatch);
             }
-
             let user_balance = get_balance(&env, &caller);
             if shares > user_balance {
                 return Err(VaultError::InsufficientShares);
             }
-
             let total_shares = get_total_shares(&env);
-
             let numerator = shares
                 .checked_mul(total_deposited)
                 .ok_or(VaultError::MathOverflow)?;
             let redeem_amount = numerator
                 .checked_div(total_shares)
                 .ok_or(VaultError::MathOverflow)?;
-
             if redeem_amount <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
             if total_deposited < redeem_amount {
                 return Err(VaultError::InsufficientUnderlying);
             }
+
+            // -----------------------------------------------------------------------
+            // Withdrawal rate limit check (Issue #913)
+            // -----------------------------------------------------------------------
+            let max_withdrawal_bps = get_max_withdrawal_bps(&env);
+            if max_withdrawal_bps > 0 {
+                let current_ledger = env.ledger().sequence();
+                let last_ledger = get_last_withdrawal_ledger(&env);
+                
+                let current_withdrawals = if current_ledger > last_ledger {
+                    0 // Reset counter for a new ledger
+                } else {
+                    get_current_ledger_withdrawals(&env)
+                };
+
+                // max_allowed = total_deposited * max_withdrawal_bps / 10_000
+                let max_allowed = total_deposited
+                    .checked_mul(max_withdrawal_bps as i128)
+                    .ok_or(VaultError::MathOverflow)?
+                    .checked_div(10_000)
+                    .ok_or(VaultError::MathOverflow)?;
+
+                let new_total_withdrawals = current_withdrawals
+                    .checked_add(redeem_amount)
+                    .ok_or(VaultError::MathOverflow)?;
+
+                if new_total_withdrawals > max_allowed {
+                    env.events().publish(
+                        (Symbol::new(&env, "withdrawal_limit_hit"), caller.clone()),
+                        (redeem_amount, max_allowed),
+                    );
+                    return Err(VaultError::WithdrawalLimitExceeded);
+                }
+
+                set_last_withdrawal_ledger(&env, current_ledger);
+                set_current_ledger_withdrawals(&env, new_total_withdrawals);
+            }
+            // -----------------------------------------------------------------------
 
             // CEI — Effects: burn shares before any token transfer
             let new_balance = user_balance - shares;
@@ -588,10 +584,8 @@ impl AuraVault {
                 .checked_sub(redeem_amount)
                 .ok_or(VaultError::MathOverflow)?;
             set_total_deposited(&env, new_total_deposited);
-
             bump_persistent(&env, &caller);
             bump_instance(&env);
-
             // -----------------------------------------------------------------------
             // Withdrawal queue: if the redemption amount meets or exceeds the
             // configured threshold, queue the withdrawal instead of sending tokens.
@@ -603,10 +597,8 @@ impl AuraVault {
             if queue_threshold > 0 && redeem_amount >= queue_threshold {
                 let unbonding_secs = get_withdrawal_unbonding_secs(&env);
                 let claimable_after = env.ledger().timestamp().saturating_add(unbonding_secs);
-
                 let entry_id = get_withdrawal_next_id(&env);
                 set_withdrawal_next_id(&env, entry_id + 1);
-
                 let entry = WithdrawalEntry {
                     owner: caller.clone(),
                     shares,
@@ -615,20 +607,16 @@ impl AuraVault {
                     claimed: false,
                 };
                 set_withdrawal_entry(&env, entry_id, &entry);
-
                 // Event: topics = (event_name, caller, entry_id) — indexed.
                 env.events().publish(
                     (Symbol::new(&env, "withdraw_queued"), caller.clone(), entry_id),
                     (shares, redeem_amount, claimable_after, new_total_shares, new_total_deposited),
                 );
-
                 return Err(VaultError::WithdrawalQueued);
             }
-
             // -----------------------------------------------------------------------
             // Instant withdrawal path
             // -----------------------------------------------------------------------
-
             // Interaction: send tokens to caller after all state is settled
             let vault_addr = env.current_contract_address();
             let pre_withdraw_balance = token.balance(&vault_addr);
@@ -646,14 +634,11 @@ impl AuraVault {
                 (Symbol::new(&env, "withdraw"), caller.clone(), shares),
                 (redeem_amount, new_total_shares, new_total_deposited, share_price, timestamp),
             );
-
             bump_persistent(&env, &caller);
             bump_instance(&env);
-
             Ok(redeem_amount)
         })
     }
-
     // -----------------------------------------------------------------------
     // Withdrawal queue configuration — admin-only
     //
@@ -672,7 +657,6 @@ impl AuraVault {
     //   4. A `withdrawal_fee_bps` may be charged at claim time; the fee is
     //      added to `total_fee_collected` (goes to the treasury).
     // -----------------------------------------------------------------------
-
     /// Admin: set the threshold above which withdrawals are queued.
     ///
     /// `threshold = 0` disables the queue (all withdrawals are instant).
@@ -701,7 +685,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Admin: set the unbonding period for queued withdrawals (seconds).
     ///
     /// Queued withdrawals cannot be claimed until `unbonding_secs` have
@@ -732,7 +715,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Admin: set the withdrawal fee in basis points (0–500, i.e., 0–5%).
     ///
     /// The fee is deducted from the redeemed amount when a queued withdrawal
@@ -767,20 +749,44 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Read the current withdrawal queue threshold (0 = queue disabled).
     pub fn get_withdrawal_queue_threshold(env: Env) -> i128 {
         storage::get_withdrawal_queue_threshold(&env)
     }
-
     /// Read the current unbonding period in seconds.
     pub fn get_withdrawal_unbonding_secs(env: Env) -> u64 {
         storage::get_withdrawal_unbonding_secs(&env)
     }
-
     /// Read the current withdrawal fee in basis points.
     pub fn get_withdrawal_fee_bps(env: Env) -> u32 {
         storage::get_withdrawal_fee_bps(&env)
+    }
+
+    // -----------------------------------------------------------------------
+    // Withdrawal rate limit configuration — admin-only (Issue #913)
+    // -----------------------------------------------------------------------
+    /// Set the maximum percentage of total assets withdrawable per ledger (in basis points).
+    /// `bps = 0` disables the rate limit.
+    pub fn set_max_withdrawal_bps(env: Env, admin: Address, bps: u32) -> Result<(), VaultError> {
+        with_reentrancy_guard(&env, || {
+            let stored_admin = get_admin(&env).ok_or(VaultError::NotInitialized)?;
+            if stored_admin != admin {
+                return Err(VaultError::UpgradeUnauthorized);
+            }
+            admin.require_auth();
+            storage::set_max_withdrawal_bps(&env, bps);
+            bump_instance(&env);
+            env.events().publish(
+                (Symbol::new(&env, "max_withdrawal_bps_set"), admin),
+                (bps,),
+            );
+            Ok(())
+        })
+    }
+
+    /// Read the current maximum withdrawal limit in basis points (0 = disabled).
+    pub fn get_max_withdrawal_bps(env: Env) -> u32 {
+        storage::get_max_withdrawal_bps(&env)
     }
 
     // -----------------------------------------------------------------------
@@ -827,29 +833,24 @@ impl AuraVault {
     ) -> Result<i128, VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if get_admin(&env).is_none() {
                 return Err(VaultError::NotInitialized);
             }
             if storage_is_paused(&env) {
                 return Err(VaultError::VaultPaused);
             }
-
             // Load the queue entry
             let entry = get_withdrawal_entry(&env, entry_id)
                 .ok_or(VaultError::QueueEntryNotFound)?;
-
             // Verify ownership
             if entry.owner != caller {
                 return Err(VaultError::InsufficientShares);
             }
-
             // Check unbonding period
             let now = env.ledger().timestamp();
             if now < entry.claimable_after {
                 return Err(VaultError::QueueUnbondingPending);
             }
-
             // Calculate fee on the redeem amount
             let fee_bps = get_withdrawal_fee_bps(&env);
             let fee_amount: i128 = if fee_bps > 0 {
@@ -861,15 +862,12 @@ impl AuraVault {
             } else {
                 0
             };
-
             let net_amount = entry.redeem_amount
                 .checked_sub(fee_amount)
                 .ok_or(VaultError::MathOverflow)?;
-
             if net_amount <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
-
             // CEI — Effects: remove entry and accrue fee before interaction
             remove_withdrawal_entry(&env, entry_id);
             if fee_amount > 0 {
@@ -879,7 +877,6 @@ impl AuraVault {
                     prev_fees.checked_add(fee_amount).ok_or(VaultError::MathOverflow)?,
                 );
             }
-
             // Interaction: transfer tokens to caller
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
@@ -887,20 +884,16 @@ impl AuraVault {
             let pre_claim_balance = token.balance(&vault_addr);
             token.transfer(&vault_addr, &caller, &net_amount);
             assert_outgoing_transfer(&token, &vault_addr, pre_claim_balance, net_amount)?;
-
             // Event: topics = (event_name, caller, entry_id) — indexed.
             env.events().publish(
                 (Symbol::new(&env, "withdrawal_claimed"), caller.clone(), entry_id),
                 (entry.redeem_amount, fee_amount, net_amount),
             );
-
             bump_persistent(&env, &caller);
             bump_instance(&env);
-
             Ok(net_amount)
         })
     }
-
     /// Read a withdrawal queue entry by ID.
     ///
     /// Returns `None` if the entry does not exist (was never created or was
@@ -936,7 +929,6 @@ impl AuraVault {
     pub fn harvest(env: Env, caller: Address, yield_amount: i128) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if yield_amount <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
@@ -946,17 +938,14 @@ impl AuraVault {
             if storage_is_paused(&env) {
                 return Err(VaultError::VaultPaused);
             }
-
             // Issue #357: harvest requires KEEPER or ADMIN role
             if !has_role(&env, &caller, ROLE_KEEPER) && !has_role(&env, &caller, ROLE_ADMIN) {
                 return Err(VaultError::Unauthorized);
             }
-
             let total_shares = get_total_shares(&env);
             if total_shares == 0 {
                 return Err(VaultError::ZeroShares);
             }
-
             // Harvest cooldown check — Issue #471
             // If a cooldown is configured, reject harvests that arrive too soon.
             let cooldown_secs = get_harvest_cooldown_secs(&env);
@@ -970,12 +959,9 @@ impl AuraVault {
                     }
                 }
             }
-
             let total_deposited = get_total_deposited(&env);
-
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
-
             // Flash-loan guard
             let balance_before = token.balance(&env.current_contract_address());
             if balance_before != total_deposited {
@@ -985,22 +971,18 @@ impl AuraVault {
                 );
                 return Err(VaultError::BalanceMismatch);
             }
-
             let perf_fee_bps = storage::get_perf_fee_bps(&env);
             let fee_amount = fee::calc_perf_fee(yield_amount, perf_fee_bps)?;
             let yield_after_fee = yield_amount
                 .checked_sub(fee_amount)
                 .ok_or(VaultError::MathOverflow)?;
-
             let current_fees = storage::get_total_fee_collected(&env);
             let new_fees = current_fees
                 .checked_add(fee_amount)
                 .ok_or(VaultError::MathOverflow)?;
-
             let new_total = total_deposited
                 .checked_add(yield_after_fee)
                 .ok_or(VaultError::MathOverflow)?;
-
             // -----------------------------------------------------------------------
             // Circuit-breaker check — Issue #371
             //
@@ -1048,30 +1030,24 @@ impl AuraVault {
                     return Err(VaultError::CircuitBreakerTripped);
                 }
             }
-
             // Interaction: pull yield tokens into vault
             let vault_addr = env.current_contract_address();
             let pre_harvest_balance = token.balance(&vault_addr);
             token.transfer(&caller, &vault_addr, &yield_amount);
             assert_incoming_transfer(&token, &vault_addr, pre_harvest_balance, yield_amount)?;
-
             // Effects: increase total deposited with net yield; accumulate fees
             set_total_deposited(&env, new_total);
             storage::set_total_fee_collected(&env, new_fees);
             // Record harvest timestamp for cooldown enforcement (Issue #471)
             set_last_harvest_time(&env, env.ledger().timestamp());
-
             env.events().publish(
                 (Symbol::new(&env, "harvest"), caller.clone(), yield_amount),
                 (yield_after_fee, fee_amount, new_total),
             );
-
             bump_instance(&env);
-
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // harvest_token — multi-yield-token entry point (Issue #48)
     // -----------------------------------------------------------------------
@@ -1121,7 +1097,6 @@ impl AuraVault {
     ) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
         if yield_amount <= 0 || underlying_amount <= 0 {
             return Err(VaultError::ZeroAmount);
         }
@@ -1132,19 +1107,15 @@ impl AuraVault {
         if storage_is_paused(&env) {
             return Err(VaultError::VaultPaused);
         }
-
             let total_shares = get_total_shares(&env);
             if total_shares == 0 {
                 return Err(VaultError::ZeroShares);
             }
-
             // Verify the alt_token is whitelisted
             if !storage::is_yield_token(&env, &alt_token) {
                 return Err(VaultError::InvalidAddress);
             }
-
             let total_deposited = get_total_deposited(&env);
-
             // Flash-loan guard on underlying token
             let underlying_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let underlying = token::Client::new(&env, &underlying_addr);
@@ -1156,14 +1127,12 @@ impl AuraVault {
                 );
                 return Err(VaultError::BalanceMismatch);
             }
-
             let perf_fee_bps = storage::get_perf_fee_bps(&env);
             let fee_amount = fee::calc_perf_fee(underlying_amount, perf_fee_bps)
                 .unwrap_or(0);
             let net_underlying = underlying_amount
                 .checked_sub(fee_amount)
                 .ok_or(VaultError::MathOverflow)?;
-
             // Oracle sanity guard: validate the caller-supplied underlying_amount
             // against the oracle price constraints (zero, sanity-cap, staleness).
             validate_oracle_price(
@@ -1172,18 +1141,15 @@ impl AuraVault {
                 env.ledger().timestamp(),
                 ORACLE_DEFAULT_MAX_AGE_SECS,
             )?;
-
             let new_total = total_deposited
                 .checked_add(net_underlying)
                 .ok_or(VaultError::MathOverflow)?;
-
             // Interaction: pull alt-token yield from caller
             let alt_token_client = token::Client::new(&env, &alt_token);
             let vault_addr = env.current_contract_address();
             let pre_alt_balance = alt_token_client.balance(&vault_addr);
             alt_token_client.transfer(&caller, &vault_addr, &yield_amount);
             assert_incoming_transfer(&alt_token_client, &vault_addr, pre_alt_balance, yield_amount)?;
-
             // Effects: credit net underlying value
             set_total_deposited(&env, new_total);
             let prev_fees = storage::get_total_fee_collected(&env);
@@ -1191,18 +1157,14 @@ impl AuraVault {
                 &env,
                 prev_fees.checked_add(fee_amount).ok_or(VaultError::MathOverflow)?,
             );
-
             env.events().publish(
                 (Symbol::new(&env, "harvest_token"), caller, alt_token),
                 (yield_amount, net_underlying, fee_amount),
             );
-
             bump_instance(&env);
-
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // register_yield_token — admin-only: whitelist an alt yield token
     // -----------------------------------------------------------------------
@@ -1234,14 +1196,12 @@ impl AuraVault {
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // distribute_yield — permissionless keeper entry point
     // -----------------------------------------------------------------------
     pub fn distribute_yield(env: Env, caller: Address, yield_amount: i128) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if yield_amount <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
@@ -1251,12 +1211,10 @@ impl AuraVault {
             if storage_is_paused(&env) {
                 return Err(VaultError::VaultPaused);
             }
-
             let total_shares = get_total_shares(&env);
             if total_shares == 0 {
                 return Err(VaultError::ZeroShares);
             }
-
             // --- Flash-loan guard on underlying token ---
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
@@ -1269,14 +1227,12 @@ impl AuraVault {
                 );
                 return Err(VaultError::BalanceMismatch);
             }
-
             // --- Performance fee ---
             let perf_fee_bps = storage::get_perf_fee_bps(&env);
             let fee_amount = fee::calc_perf_fee(yield_amount, perf_fee_bps)?;
             let net_yield = yield_amount
                 .checked_sub(fee_amount)
                 .ok_or(VaultError::MathOverflow)?;
-
             // --- Accuracy guard: net_yield must produce a non-zero delta_yps ---
             let scaled = net_yield
                 .checked_mul(YIELD_PRECISION)
@@ -1287,7 +1243,6 @@ impl AuraVault {
             if delta_yps == 0 {
                 return Err(VaultError::YieldTooSmall);
             }
-
             // --- Accuracy check: distributed tokens ≈ net_yield within 0.01% ---
             let distributed = delta_yps
                 .checked_mul(total_shares)
@@ -1303,49 +1258,41 @@ impl AuraVault {
             if diff > tolerance {
                 return Err(VaultError::DistributionAccuracyError);
             }
-
             // --- CEI: Interaction first — pull tokens ---
             let vault_addr = env.current_contract_address();
             let pre_dist_balance = token.balance(&vault_addr);
             token.transfer(&caller, &vault_addr, &yield_amount);
             assert_incoming_transfer(&token, &vault_addr, pre_dist_balance, yield_amount)?;
-
             // --- Effects: update global state ---
             let prev_yps = storage::get_cumulative_yps(&env);
             let new_yps = prev_yps
                 .checked_add(delta_yps)
                 .ok_or(VaultError::MathOverflow)?;
             storage::set_cumulative_yps(&env, new_yps);
-
             // Credit net yield to total_deposited so share price and withdraw math stay consistent.
             let new_total = total_deposited
                 .checked_add(net_yield)
                 .ok_or(VaultError::MathOverflow)?;
             set_total_deposited(&env, new_total);
-
             // Accumulate fees
             let prev_fees = storage::get_total_fee_collected(&env);
             storage::set_total_fee_collected(
                 &env,
                 prev_fees.checked_add(fee_amount).ok_or(VaultError::MathOverflow)?,
             );
-
             // Bump distribution epoch
             let epoch = storage::get_distribution_epoch(&env);
             let new_epoch = epoch + 1;
             storage::set_distribution_epoch(&env, new_epoch);
-
             // --- Events ---
             env.events().publish(
                 (Symbol::new(&env, "yield_distributed"), caller.clone()),
                 (yield_amount, net_yield, fee_amount, total_shares, new_yps, new_epoch),
             );
-
             bump_instance(&env);
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // distribute_yield_token — distribute a whitelisted alt yield token
     // -----------------------------------------------------------------------
@@ -1358,7 +1305,6 @@ impl AuraVault {
     ) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if yield_amount <= 0 || underlying_amount <= 0 {
                 return Err(VaultError::ZeroAmount);
             }
@@ -1371,12 +1317,10 @@ impl AuraVault {
             if !storage::is_yield_token(&env, &alt_token) {
                 return Err(VaultError::InvalidAddress);
             }
-
             let total_shares = get_total_shares(&env);
             if total_shares == 0 {
                 return Err(VaultError::ZeroShares);
             }
-
             // Flash-loan guard on underlying token
             let underlying_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let underlying = token::Client::new(&env, &underlying_addr);
@@ -1389,14 +1333,12 @@ impl AuraVault {
                 );
                 return Err(VaultError::BalanceMismatch);
             }
-
             // Performance fee on underlying value
             let perf_fee_bps = storage::get_perf_fee_bps(&env);
             let fee_amount = fee::calc_perf_fee(underlying_amount, perf_fee_bps)?;
             let net_underlying = underlying_amount
                 .checked_sub(fee_amount)
                 .ok_or(VaultError::MathOverflow)?;
-
             // Oracle sanity guard
             validate_oracle_price(
                 &env,
@@ -1404,7 +1346,6 @@ impl AuraVault {
                 env.ledger().timestamp(),
                 ORACLE_DEFAULT_MAX_AGE_SECS,
             )?;
-
             // Accuracy guard
             let scaled = net_underlying
                 .checked_mul(YIELD_PRECISION)
@@ -1415,7 +1356,6 @@ impl AuraVault {
             if delta_yps == 0 {
                 return Err(VaultError::YieldTooSmall);
             }
-
             // Accuracy check
             let distributed = delta_yps
                 .checked_mul(total_shares)
@@ -1431,53 +1371,44 @@ impl AuraVault {
             if diff > tolerance {
                 return Err(VaultError::DistributionAccuracyError);
             }
-
             // Interaction: pull alt-token yield from caller
             let alt_token_client = token::Client::new(&env, &alt_token);
             let vault_addr = env.current_contract_address();
             let pre_alt_balance = alt_token_client.balance(&vault_addr);
             alt_token_client.transfer(&caller, &vault_addr, &yield_amount);
             assert_incoming_transfer(&alt_token_client, &vault_addr, pre_alt_balance, yield_amount)?;
-
             // Effects
             let prev_yps = storage::get_cumulative_yps(&env);
             let new_yps = prev_yps
                 .checked_add(delta_yps)
                 .ok_or(VaultError::MathOverflow)?;
             storage::set_cumulative_yps(&env, new_yps);
-
             let new_total = total_deposited
                 .checked_add(net_underlying)
                 .ok_or(VaultError::MathOverflow)?;
             set_total_deposited(&env, new_total);
-
             let prev_fees = storage::get_total_fee_collected(&env);
             storage::set_total_fee_collected(
                 &env,
                 prev_fees.checked_add(fee_amount).ok_or(VaultError::MathOverflow)?,
             );
-
             let epoch = storage::get_distribution_epoch(&env);
             let new_epoch = epoch + 1;
             storage::set_distribution_epoch(&env, new_epoch);
-
             env.events().publish(
                 (Symbol::new(&env, "yield_distributed_token"), caller, alt_token),
                 (yield_amount, net_underlying, fee_amount, total_shares, new_yps, new_epoch),
             );
-
             bump_instance(&env);
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // collect_yield — keeper / strategy pulls yield into the vault
     // -----------------------------------------------------------------------
     pub fn collect_yield(env: Env, caller: Address, amount: i128) -> Result<(), VaultError> {
         Self::distribute_yield(env, caller, amount)
     }
-
     // -----------------------------------------------------------------------
     // preview_distribution — read-only accuracy check
     // -----------------------------------------------------------------------
@@ -1488,36 +1419,30 @@ impl AuraVault {
         if get_admin(&env).is_none() {
             return Err(VaultError::NotInitialized);
         }
-
         let total_shares = get_total_shares(&env);
         if total_shares == 0 {
             return Err(VaultError::ZeroShares);
         }
-
         let perf_fee_bps = storage::get_perf_fee_bps(&env);
         let fee_amount = fee::calc_perf_fee(yield_amount, perf_fee_bps)?;
         let net_yield = yield_amount
             .checked_sub(fee_amount)
             .ok_or(VaultError::MathOverflow)?;
-
         let scaled = net_yield
             .checked_mul(YIELD_PRECISION)
             .ok_or(VaultError::MathOverflow)?;
         let delta_yps = scaled
             .checked_div(total_shares)
             .ok_or(VaultError::MathOverflow)?;
-
         if delta_yps == 0 {
             // Not enough yield to produce any delta — would revert on-chain.
             return Ok((net_yield, 0, 0, false));
         }
-
         let distributed = delta_yps
             .checked_mul(total_shares)
             .ok_or(VaultError::MathOverflow)?
             .checked_div(YIELD_PRECISION)
             .ok_or(VaultError::MathOverflow)?;
-
         let tolerance = net_yield
             .checked_add(9_999)
             .ok_or(VaultError::MathOverflow)?
@@ -1525,28 +1450,23 @@ impl AuraVault {
             .ok_or(VaultError::MathOverflow)?;
         let diff = (distributed - net_yield).abs();
         let accuracy_ok = diff <= tolerance;
-
         Ok((net_yield, delta_yps, distributed, accuracy_ok))
     }
-
     // -----------------------------------------------------------------------
     // collect_pending_yield — shareholder claims their accrued yield
     // -----------------------------------------------------------------------
     pub fn collect_pending_yield(env: Env, caller: Address) -> Result<i128, VaultError> {
         with_reentrancy_guard(&env, || {
             caller.require_auth();
-
             if get_admin(&env).is_none() {
                 return Err(VaultError::NotInitialized);
             }
             if storage_is_paused(&env) {
                 return Err(VaultError::VaultPaused);
             }
-
             let user_shares = get_balance(&env, &caller);
             let global_yps = storage::get_cumulative_yps(&env);
             let user_checkpoint = storage::get_user_checkpoint(&env, &caller);
-
             // Accrue: new yield since last checkpoint
             let delta_yps = global_yps
                 .checked_sub(user_checkpoint)
@@ -1556,13 +1476,11 @@ impl AuraVault {
                 .ok_or(VaultError::MathOverflow)?
                 .checked_div(YIELD_PRECISION)
                 .ok_or(VaultError::MathOverflow)?;
-
             // Add any previously stored (unsettled) pending yield
             let stored_pending = storage::get_user_pending_yield(&env, &caller);
             let total_claimable = stored_pending
                 .checked_add(accrued)
                 .ok_or(VaultError::MathOverflow)?;
-
             if total_claimable <= 0 {
                 // Nothing to collect; update checkpoint and return 0.
                 storage::set_user_checkpoint(&env, &caller, global_yps);
@@ -1571,11 +1489,9 @@ impl AuraVault {
                 bump_persistent(&env, &caller);
                 return Ok(0);
             }
-
             // CEI — Effects: clear pending state before interaction
             storage::set_user_checkpoint(&env, &caller, global_yps);
             storage::set_user_pending_yield(&env, &caller, 0);
-
             // Interaction: transfer claimable yield to caller
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
@@ -1583,26 +1499,21 @@ impl AuraVault {
             let pre_collect_balance = token.balance(&vault_addr);
             token.transfer(&vault_addr, &caller, &total_claimable);
             assert_outgoing_transfer(&token, &vault_addr, pre_collect_balance, total_claimable)?;
-
             let total_deposited = get_total_deposited(&env);
             let new_deposited = total_deposited
                 .checked_sub(total_claimable)
                 .ok_or(VaultError::MathOverflow)?;
             set_total_deposited(&env, new_deposited);
-
             env.events().publish(
                 (Symbol::new(&env, "yield_collected"), caller.clone()),
                 (total_claimable, global_yps, new_deposited),
             );
-
             bump_user_yield(&env, &caller);
             bump_persistent(&env, &caller);
             bump_instance(&env);
-
             Ok(total_claimable)
         })
     }
-
     // -----------------------------------------------------------------------
     // pending_yield — read-only: how much yield `addr` can currently claim
     // -----------------------------------------------------------------------
@@ -1610,25 +1521,21 @@ impl AuraVault {
         let user_shares = get_balance(&env, &addr);
         let global_yps = storage::get_cumulative_yps(&env);
         let user_checkpoint = storage::get_user_checkpoint(&env, &addr);
-
         let delta_yps = global_yps.saturating_sub(user_checkpoint);
         let accrued = user_shares
             .checked_mul(delta_yps)
             .and_then(|v| v.checked_div(YIELD_PRECISION))
             .unwrap_or(0);
-
         storage::get_user_pending_yield(&env, &addr)
             .checked_add(accrued)
             .unwrap_or(0)
     }
-
     // -----------------------------------------------------------------------
     // distribution_epoch — read-only: current distribution epoch counter
     // -----------------------------------------------------------------------
     pub fn distribution_epoch(env: Env) -> u64 {
         storage::get_distribution_epoch(&env)
     }
-
     // -----------------------------------------------------------------------
     // pause / unpause — admin-only emergency controls
     // Takes admin address so the client can require_auth on it.
@@ -1666,7 +1573,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Resume vault operations after a [`pause`].
     ///
     /// Requires GUARDIAN or ADMIN role. Emits an `unpaused` event.
@@ -1697,14 +1603,12 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Returns `true` if the vault is currently paused, `false` otherwise.
     ///
     /// Read-only view; no authorisation required.
     pub fn is_paused(env: Env) -> bool {
         storage_is_paused(&env)
     }
-
     /// Return the pending admin address, if one exists.
     pub fn pending_admin(env: Env) -> Option<Address> {
         let pending = storage::get_pending_admin(&env)?;
@@ -1714,7 +1618,6 @@ impl AuraVault {
             Some(pending)
         }
     }
-
     /// Propose a new admin address. The current admin must authorize the call.
     pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -1734,7 +1637,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Accept the pending admin transfer. The pending admin must authorize the call.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -1766,7 +1668,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Cancel a pending admin transfer. The current admin must authorize the call.
     pub fn cancel_admin(env: Env, current_admin: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -1785,17 +1686,14 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Return the role bitmask for an address.
     pub fn get_roles(env: Env, addr: Address) -> u32 {
         storage::get_role_mask(&env, &addr)
     }
-
     /// Return `true` if the address holds all bits in `role_mask`.
     pub fn has_role_query(env: Env, addr: Address, role_mask: u32) -> bool {
         storage::has_role(&env, &addr, role_mask)
     }
-
     /// Grant a role to an address. Admin-only.
     pub fn grant_role(env: Env, admin: Address, role: u32, addr: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -1815,7 +1713,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Revoke a role from an address. Admin-only.
     pub fn revoke_role(env: Env, admin: Address, role: u32, addr: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -1835,11 +1732,9 @@ impl AuraVault {
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // Fee administration — admin-only
     // -----------------------------------------------------------------------
-
     /// Set performance and management fee rates.
     ///
     /// Admin-only. Fees are expressed in **basis points** where
@@ -1876,7 +1771,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Set the treasury address where accumulated fees are sent.
     ///
     /// Admin-only. The treasury address must be configured before
@@ -1906,7 +1800,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Transfer all accumulated performance fees to the treasury.
     ///
     /// Admin-only. Resets the internal fee counter to zero after transferring.
@@ -1933,16 +1826,13 @@ impl AuraVault {
                 return Err(VaultError::UpgradeUnauthorized);
             }
             admin.require_auth();
-
             let fees = storage::get_total_fee_collected(&env);
             if fees <= 0 {
                 return Ok(0);
             }
-
             let treasury = storage::get_treasury(&env).ok_or(VaultError::NotInitialized)?;
             let token_addr = get_token(&env).ok_or(VaultError::NotInitialized)?;
             let token = token::Client::new(&env, &token_addr);
-
             // Adjust total_deposited: fees were already excluded from it during harvest,
             // so we just transfer from vault balance.
             let vault_addr = env.current_contract_address();
@@ -1950,17 +1840,14 @@ impl AuraVault {
             token.transfer(&vault_addr, &treasury, &fees);
             assert_outgoing_transfer(&token, &vault_addr, pre_fees_balance, fees)?;
             storage::set_total_fee_collected(&env, 0);
-
             env.events().publish(
                 (Symbol::new(&env, "fees_withdrawn"), admin),
                 (fees, treasury),
             );
-
             bump_instance(&env);
             Ok(fees)
         })
     }
-
     /// Returns the total accumulated but not-yet-withdrawn performance fees,
     /// in underlying token units.
     ///
@@ -1968,11 +1855,9 @@ impl AuraVault {
     pub fn total_fees_collected(env: Env) -> i128 {
         storage::get_total_fee_collected(&env)
     }
-
     // -----------------------------------------------------------------------
     // TVL cap — admin-only (Issue #467)
     // -----------------------------------------------------------------------
-
     /// Set or update the TVL cap. `cap = 0` disables the cap (unlimited deposits).
     pub fn set_tvl_cap(env: Env, admin: Address, cap: i128) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -1986,16 +1871,13 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Read the current TVL cap (0 = unlimited).
     pub fn get_tvl_cap(env: Env) -> i128 {
         storage::get_tvl_cap(&env)
     }
-
     // -----------------------------------------------------------------------
     // Harvest cooldown — admin-only (Issue #471)
     // -----------------------------------------------------------------------
-
     /// Configure the minimum seconds between harvests. `secs = 0` disables cooldown.
     pub fn set_harvest_cooldown(env: Env, admin: Address, secs: u64) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -2009,7 +1891,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Admin override: reset the last-harvest timestamp, bypassing the cooldown.
     /// Useful for emergency re-harvest after a failed yield event.
     pub fn reset_harvest_cooldown(env: Env, admin: Address) -> Result<(), VaultError> {
@@ -2024,16 +1905,13 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Read the timestamp of the last successful harvest.
     pub fn last_harvest_time(env: Env) -> u64 {
         get_last_harvest_time(&env)
     }
-
     // -----------------------------------------------------------------------
     // Circuit breaker — share-price movement limit (Issue #371)
     // -----------------------------------------------------------------------
-
     /// Set the maximum allowed share-price movement per harvest, in basis points.
     ///
     /// Admin-only.  When the price change in a single harvest exceeds this
@@ -2069,7 +1947,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Read the current share-price movement limit in basis points.
     ///
     /// Returns `0` when the circuit breaker is disabled.
@@ -2077,7 +1954,6 @@ impl AuraVault {
     pub fn get_price_movement_limit(env: Env) -> u32 {
         storage::get_price_movement_limit(&env)
     }
-
     // -----------------------------------------------------------------------
     // total_assets  (read-only)
     // -----------------------------------------------------------------------
@@ -2092,14 +1968,12 @@ impl AuraVault {
     pub fn total_assets(env: Env) -> i128 {
         get_total_deposited(&env)
     }
-
     // -----------------------------------------------------------------------
     // total_shares  (read-only)
     // -----------------------------------------------------------------------
     pub fn total_shares(env: Env) -> i128 {
         get_total_shares(&env)
     }
-
     // -----------------------------------------------------------------------
     // balance_of  (read-only)
     // -----------------------------------------------------------------------
@@ -2118,7 +1992,6 @@ impl AuraVault {
     pub fn balance_of(env: Env, address: Address) -> i128 {
         get_balance(&env, &address)
     }
-
     // -----------------------------------------------------------------------
     // Upgrade
     // -----------------------------------------------------------------------
@@ -2149,32 +2022,25 @@ impl AuraVault {
         with_reentrancy_guard(&env, || {
             let admin = get_admin(&env).ok_or(VaultError::NotInitialized)?;
             admin.require_auth();
-
             let current_version = get_layout_version(&env);
             if current_version != CURRENT_LAYOUT_VERSION {
                 return Err(VaultError::StorageLayoutMismatch);
             }
-
             let old_version = get_version(&env);
             let new_version = old_version + 1;
             set_version(&env, new_version);
-
             env.deployer().update_current_contract_wasm(new_wasm_hash);
-
             env.events().publish(
                 (Symbol::new(&env, "upgrade"), admin),
                 (old_version, new_version),
             );
-
             bump_instance(&env);
             Ok(())
         })
     }
-
     // -----------------------------------------------------------------------
     // Governance Methods
     // -----------------------------------------------------------------------
-
     /// Create a governance proposal to replace the admin address.
     ///
     /// `proposer` must be in the governance signer whitelist and must
@@ -2191,7 +2057,6 @@ impl AuraVault {
             create_proposal(&env, proposer, ProposalType::UpdateAdmin)
         })
     }
-
     /// Create a governance proposal to replace the underlying token address.
     ///
     /// `proposer` must be in the governance signer whitelist and must
@@ -2205,7 +2070,6 @@ impl AuraVault {
             create_proposal(&env, proposer, ProposalType::UpdateUnderlyingToken)
         })
     }
-
     /// Create a governance proposal to update a named protocol parameter.
     ///
     /// `proposer` must be in the governance signer whitelist.
@@ -2228,7 +2092,6 @@ impl AuraVault {
             create_proposal(&env, proposer, ProposalType::UpdateParameter(name, value))
         })
     }
-
     /// Vote to approve or reject an open governance proposal.
     ///
     /// `voter` must be in the governance signer whitelist and must not have
@@ -2249,7 +2112,6 @@ impl AuraVault {
             vote_on_proposal(&env, voter, proposal_id, approve)
         })
     }
-
     /// Execute an approved governance proposal after its timelock has elapsed.
     ///
     /// The proposal must be in `Approved` status. On success the status moves
@@ -2270,7 +2132,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Returns the status of a governance proposal as a human-readable string,
     /// or `None` if the proposal ID does not exist.
     ///
@@ -2287,11 +2148,9 @@ impl AuraVault {
             }
         })
     }
-
     // -----------------------------------------------------------------------
     // get_vault_error_message — ABI-exposed error string lookup (Issue #370)
     // -----------------------------------------------------------------------
-
     /// Return the human-readable English message for a given [`VaultError`]
     /// discriminant, or `None` if the code is not a known variant.
     ///
@@ -2345,11 +2204,9 @@ impl AuraVault {
         };
         msg.map(|s| soroban_sdk::String::from_str(&env, s))
     }
-
     // -----------------------------------------------------------------------
     // Whitelist-only deposit mode (Issue #349)
     // -----------------------------------------------------------------------
-
     /// Admin: enable whitelist-only deposit mode.
     pub fn enable_whitelist(env: Env, admin: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -2367,7 +2224,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Admin: disable whitelist-only deposit mode.
     pub fn disable_whitelist(env: Env, admin: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -2385,7 +2241,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Admin: add an address to the whitelist.
     pub fn add_to_whitelist(env: Env, admin: Address, addr: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -2404,7 +2259,6 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Admin: remove an address from the whitelist.
     pub fn remove_from_whitelist(env: Env, admin: Address, addr: Address) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -2422,16 +2276,13 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Query whether an address is whitelisted. Read-only, no auth required.
     pub fn is_whitelisted(env: Env, addr: Address) -> bool {
         storage::is_whitelisted(&env, &addr)
     }
-
     // -----------------------------------------------------------------------
     // Minimum deposit amount (Issue #355)
     // -----------------------------------------------------------------------
-
     /// Admin: set the minimum deposit amount.
     pub fn set_min_deposit(env: Env, admin: Address, amount: i128) -> Result<(), VaultError> {
         with_reentrancy_guard(&env, || {
@@ -2449,31 +2300,25 @@ impl AuraVault {
             Ok(())
         })
     }
-
     /// Query the minimum deposit amount. Read-only, no auth required.
     pub fn min_deposit(env: Env) -> i128 {
         get_min_deposit(&env)
     }
-
     // -----------------------------------------------------------------------
     // Contract metadata (Issue #350)
     // -----------------------------------------------------------------------
-
     /// Returns the vault name. Read-only, no auth required.
     pub fn name(env: Env) -> Option<soroban_sdk::String> {
         get_vault_name(&env)
     }
-
     /// Returns the vault share symbol. Read-only, no auth required.
     pub fn symbol(env: Env) -> Option<soroban_sdk::String> {
         get_vault_symbol(&env)
     }
-
     /// Returns the contract version integer. Read-only, no auth required.
     pub fn version(env: Env) -> u32 {
         get_vault_version(&env)
     }
-
     /// Returns the number of decimal places used by vault shares (e.g. 7 for Stellar standard).
     /// Set during `initialize` and immutable thereafter.
     /// Read-only, no auth required.
@@ -2481,4 +2326,3 @@ impl AuraVault {
         get_decimals(&env)
     }
 }
-
