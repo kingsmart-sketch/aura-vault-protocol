@@ -45,6 +45,8 @@ pub enum VaultError {
     OperationAlreadySigned = 39,
     ThresholdNotMet        = 40,
     InvalidThreshold       = 41,
+    /// Withdrawal exceeds the maximum per-ledger rate limit (Issue #913)
+    WithdrawalLimitExceeded = 42,
 }
 impl VaultError {
     pub fn message(&self) -> &'static str {
@@ -90,6 +92,7 @@ impl VaultError {
             VaultError::OperationAlreadySigned => "Signer has already signed this operation",
             VaultError::ThresholdNotMet => "Operation signature threshold has not been met",
             VaultError::InvalidThreshold => "Invalid multi-sig threshold",
+            VaultError::WithdrawalLimitExceeded => "Withdrawal exceeds per-ledger rate limit",
         }
     }
 }
